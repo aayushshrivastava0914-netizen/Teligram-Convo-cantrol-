@@ -1,7 +1,7 @@
 {
   "name": "telegram-whatsapp-bot",
   "version": "1.0.0",
-  "description": "Server with Telegram status controls",
+  "description": "WhatsApp server with Telegram controls",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
@@ -11,8 +11,9 @@
     "express": "^4.21.2",
     "multer": "^2.0.2",
     "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
     "dotenv": "^16.4.7",
-    "node-telegram-bot-api": "^0.66.0",
-    "body-parser": "^1.20.3"
+    "body-parser": "^1.20.3",
+    "node-telegram-bot-api": "^0.66.0"
   }
 }
