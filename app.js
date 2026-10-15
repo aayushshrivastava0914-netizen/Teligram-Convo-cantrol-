@@ -1,279 +1,496 @@
+require('dotenv').config();
+
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const pino = require('pino');
 const TelegramBot = require('node-telegram-bot-api');
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    DisconnectReason,
+    Browsers
+} = require('@whiskeysockets/baileys');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
-
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_OWNER_ID = process.env.TELEGRAM_OWNER_ID;
 
+const AUTH_DIR =
+    process.env.WA_AUTH_DIR ||
+    path.join(__dirname, 'auth_info');
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Website optional; controls are available through Telegram.
+app.use(express.static(path.join(__dirname, 'public')));
+
 const users = new Map();
-let telegramBot = null;
+
+let bot = null;
+let waSocket = null;
+let waStatus = 'DISCONNECTED';
 let loaderRunning = false;
+let pairingInProgress = false;
 
-app.get('/', (req, res) => {
-    const file = path.join(__dirname, 'public', 'index.html');
+function isOwner(msg) {
+    return Boolean(
+        msg.from &&
+        TELEGRAM_OWNER_ID &&
+        String(msg.from.id) === String(TELEGRAM_OWNER_ID)
+    );
+}
 
-    if (fs.existsSync(file)) {
-        return res.sendFile(file);
+function getUser(id) {
+    if (!users.has(id)) {
+        users.set(id, {
+            step: 'uid',
+            uid: '',
+            phone: '',
+            loaderName: ''
+        });
     }
 
-    res.status(404).send('Dashboard file not found.');
-});
+    return users.get(id);
+}
 
+function menu() {
+    return {
+        reply_markup: {
+            keyboard: [
+                ['🆔 Submit UID'],
+                ['📱 Submit WhatsApp Number'],
+                ['🏷️ Loader Name'],
+                ['🔐 Generate Pairing Code'],
+                ['📊 Loader Status'],
+                ['▶️ Start Loader', '🛑 Stop Loader']
+            ],
+            resize_keyboard: true
+        }
+    };
+}
+
+async function send(chatId, message, options = {}) {
+    if (!bot) return;
+
+    return bot.sendMessage(chatId, message, options);
+}
+
+// WhatsApp connection and pairing.
+async function connectWhatsApp(phone, chatId) {
+    if (pairingInProgress) {
+        return send(
+            chatId,
+            '⏳ Pairing process already running. Please wait.'
+        );
+    }
+
+    pairingInProgress = true;
+    waStatus = 'CONNECTING';
+
+    try {
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+        const { state, saveCreds } =
+            await useMultiFileAuthState(AUTH_DIR);
+
+        const { version } = await fetchLatestBaileysVersion();
+
+        waSocket = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.ubuntu('Chrome')
+        });
+
+        waSocket.ev.on('creds.update', saveCreds);
+
+        waSocket.ev.on(
+            'connection.update',
+            async ({ connection, lastDisconnect }) => {
+                if (connection === 'open') {
+                    waStatus = 'CONNECTED';
+                    pairingInProgress = false;
+
+                    await send(
+                        chatId,
+                        '✅ WhatsApp successfully connected!',
+                        menu()
+                    );
+                }
+
+                if (connection === 'close') {
+                    waStatus = 'DISCONNECTED';
+                    pairingInProgress = false;
+
+                    const code =
+                        lastDisconnect?.error?.output?.statusCode;
+
+                    if (code === DisconnectReason.loggedOut) {
+                        await send(
+                            chatId,
+                            '⚠️ WhatsApp session logged out. Run /pair to pair again.'
+                        );
+                    }
+                }
+            }
+        );
+
+        if (!state.creds.registered) {
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            const pairingCode =
+                await waSocket.requestPairingCode(
+                    phone.replace(/\D/g, '')
+                );
+
+            await send(
+                chatId,
+                '🔐 WhatsApp Pairing Code:\n\n' +
+                `${pairingCode}\n\n` +
+                'WhatsApp खोलो → Linked Devices → Link a Device → ' +
+                'Link with phone number.\n\n' +
+                '⚠️ यह कोड किसी दूसरे व्यक्ति को मत देना।'
+            );
+        } else {
+            await send(
+                chatId,
+                'ℹ️ Saved WhatsApp session मिली है। Connection status का इंतज़ार करें।'
+            );
+        }
+    } catch (error) {
+        pairingInProgress = false;
+        waStatus = 'ERROR';
+
+        console.error('WhatsApp pairing error:', error);
+
+        await send(
+            chatId,
+            '❌ Pairing error: ' + error.message
+        );
+    }
+}
+
+// Health endpoint.
 app.get('/health', (req, res) => {
     res.json({
-        status: 'online',
-        uptime: Math.floor(process.uptime())
+        status: 'ONLINE',
+        uptime: Math.floor(process.uptime()),
+        whatsapp: waStatus
     });
 });
 
+// Status endpoint.
 app.get('/stats', (req, res) => {
     res.json({
-        status: 'online',
+        status: 'ONLINE',
+        whatsapp: waStatus,
         loaderRunning,
         registeredUsers: users.size,
         uptime: Math.floor(process.uptime())
     });
 });
 
+// Stop loader state. This does not shut down Render.
 app.post('/stop', (req, res) => {
     loaderRunning = false;
 
     res.json({
         success: true,
-        message: 'Stop request received.'
+        message: 'Loader stopped.'
     });
 });
 
-if (TELEGRAM_BOT_TOKEN && TELEGRAM_OWNER_ID) {
-    telegramBot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
-        polling: true
-    });
+app.get('/', (req, res) => {
+    const indexFile = path.join(
+        __dirname,
+        'public',
+        'index.html'
+    );
 
-    function isOwner(msg) {
-        return msg.from &&
-            String(msg.from.id) === String(TELEGRAM_OWNER_ID);
+    if (fs.existsSync(indexFile)) {
+        return res.sendFile(indexFile);
     }
 
-    function mainMenu() {
-        return {
-            reply_markup: {
-                keyboard: [
-                    ['🆔 Submit UID'],
-                    ['📱 Submit WhatsApp Number'],
-                    ['📊 Loader Status'],
-                    ['▶️ Start Loader', '🛑 Stop Loader']
-                ],
-                resize_keyboard: true
-            }
-        };
-    }
+    res.send('Telegram-controlled service is online.');
+});
 
-    telegramBot.onText(/^\/start$/, async (msg) => {
+// Initialize Telegram bot.
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_OWNER_ID) {
+    console.error(
+        'Missing TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_ID environment variable.'
+    );
+} else {
+    bot = new TelegramBot(
+        TELEGRAM_BOT_TOKEN,
+        { polling: true }
+    );
+
+    // Start setup.
+    bot.onText(/^\/start$/, async msg => {
         if (!isOwner(msg)) {
-            return telegramBot.sendMessage(
-                msg.chat.id,
-                '⛔ Access denied.'
-            );
+            return send(msg.chat.id, '⛔ Access denied.');
         }
 
-        users.set(msg.from.id, {
-            step: 'uid',
-            uid: null,
-            phone: null
-        });
+        const user = getUser(msg.from.id);
 
-        await telegramBot.sendMessage(
+        user.step = 'uid';
+
+        await send(
             msg.chat.id,
-            '🤖 Welcome to your Loader Bot!\n\n' +
-            'सबसे पहले अपनी UID भेजें।\n' +
-            'अपनी निजी जानकारी किसी अनजान व्यक्ति को न भेजें।'
+            '🤖 Welcome!\n\n' +
+            'Step 1: अपनी UID भेजो।',
+            menu()
         );
     });
 
-    telegramBot.onText(/^\/status$/, async (msg) => {
+    // Pair WhatsApp.
+    bot.onText(/^\/pair$/, async msg => {
         if (!isOwner(msg)) {
-            return telegramBot.sendMessage(
+            return send(msg.chat.id, '⛔ Access denied.');
+        }
+
+        const user = getUser(msg.from.id);
+
+        if (!user.phone) {
+            return send(
                 msg.chat.id,
-                '⛔ Access denied.'
+                'पहले /start चलाकर अपना WhatsApp नंबर दर्ज करो।'
             );
         }
 
-        await telegramBot.sendMessage(
+        await connectWhatsApp(user.phone, msg.chat.id);
+    });
+
+    // Start loader state.
+    bot.onText(/^\/startloader$/, async msg => {
+        if (!isOwner(msg)) {
+            return send(msg.chat.id, '⛔ Access denied.');
+        }
+
+        const user = getUser(msg.from.id);
+
+        if (!user.uid || !user.phone || !user.loaderName) {
+            return send(
+                msg.chat.id,
+                'पहले /start चलाकर UID, WhatsApp Number और Loader Name पूरा करो।',
+                menu()
+            );
+        }
+
+        if (waStatus !== 'CONNECTED') {
+            return send(
+                msg.chat.id,
+                '❌ WhatsApp connected नहीं है। पहले /pair चलाओ।',
+                menu()
+            );
+        }
+
+        loaderRunning = true;
+
+        await send(
             msg.chat.id,
-            '📊 Server: ONLINE\n' +
-            '⏱ Uptime: ' +
-            Math.floor(process.uptime()) + ' seconds\n' +
-            '▶️ Loader: ' +
-            (loaderRunning ? 'RUNNING' : 'STOPPED')
+            `✅ ${user.loaderName} की loader state RUNNING है।\n\n` +
+            'ध्यान दें: इस स्क्रिप्ट में automatic messaging engine शामिल नहीं है।',
+            menu()
         );
     });
 
-    telegramBot.onText(/^\/stop$/, async (msg) => {
+    // Stop loader.
+    bot.onText(/^\/stop$/, async msg => {
         if (!isOwner(msg)) {
-            return telegramBot.sendMessage(
-                msg.chat.id,
-                '⛔ Access denied.'
-            );
+            return send(msg.chat.id, '⛔ Access denied.');
         }
 
         loaderRunning = false;
 
-        await telegramBot.sendMessage(
+        await send(
             msg.chat.id,
-            '🛑 Stop request received.\n' +
-            'यह कमांड Render सर्वर को बंद नहीं करती।'
+            '🛑 Loader stopped. WhatsApp session अभी linked रह सकती है।',
+            menu()
         );
     });
 
-    telegramBot.onText(/^\/help$/, async (msg) => {
+    // Status.
+    bot.onText(/^\/status$/, async msg => {
         if (!isOwner(msg)) {
-            return telegramBot.sendMessage(
-                msg.chat.id,
-                '⛔ Access denied.'
-            );
+            return send(msg.chat.id, '⛔ Access denied.');
         }
 
-        await telegramBot.sendMessage(
+        const user = getUser(msg.from.id);
+
+        await send(
             msg.chat.id,
-            '/start - Start bot\n' +
-            '/status - Check status\n' +
-            '/stop - Stop request\n' +
-            '/help - Help menu',
-            mainMenu()
+            '📊 BOT STATUS\n\n' +
+            `Server: ONLINE\n` +
+            `Uptime: ${Math.floor(process.uptime())} seconds\n` +
+            `WhatsApp: ${waStatus}\n` +
+            `Loader: ${loaderRunning ? 'RUNNING' : 'STOPPED'}\n` +
+            `UID: ${user.uid ? 'SAVED' : 'NOT SET'}\n` +
+            `Phone: ${user.phone ? 'SAVED' : 'NOT SET'}\n` +
+            `Loader Name: ${user.loaderName || 'NOT SET'}`,
+            menu()
         );
     });
 
-    telegramBot.on('message', async (msg) => {
+    // Help.
+    bot.onText(/^\/help$/, async msg => {
+        if (!isOwner(msg)) {
+            return send(msg.chat.id, '⛔ Access denied.');
+        }
+
+        await send(
+            msg.chat.id,
+            '📚 COMMANDS\n\n' +
+            '/start - Setup\n' +
+            '/pair - WhatsApp pairing\n' +
+            '/startloader - Start loader state\n' +
+            '/status - Check status\n' +
+            '/stop - Stop loader state\n' +
+            '/help - Help',
+            menu()
+        );
+    });
+
+    // Menu buttons and setup steps.
+    bot.on('message', async msg => {
         if (!msg.text || !isOwner(msg)) return;
         if (msg.text.startsWith('/')) return;
 
         const chatId = msg.chat.id;
-        const userId = msg.from.id;
+        const user = getUser(msg.from.id);
         const text = msg.text.trim();
 
-        if (
-            ['🆔 Submit UID', '📱 Submit WhatsApp Number',
-             '📊 Loader Status', '▶️ Start Loader',
-             '🛑 Stop Loader'].includes(text)
-        ) {
-            if (text === '🆔 Submit UID') {
-                users.set(userId, { step: 'uid' });
-
-                return telegramBot.sendMessage(
-                    chatId,
-                    'अपनी UID भेजें:'
-                );
-            }
-
-            if (text === '📱 Submit WhatsApp Number') {
-                users.set(userId, {
-                    ...(users.get(userId) || {}),
-                    step: 'phone'
-                });
-
-                return telegramBot.sendMessage(
-                    chatId,
-                    'Country code सहित नंबर भेजें। उदाहरण: +91XXXXXXXXXX'
-                );
-            }
-
-            if (text === '📊 Loader Status') {
-                return telegramBot.sendMessage(
-                    chatId,
-                    'Loader: ' +
-                    (loaderRunning ? 'RUNNING' : 'STOPPED')
-                );
-            }
-
-            if (text === '▶️ Start Loader') {
-                return telegramBot.sendMessage(
-                    chatId,
-                    '⚠️ वास्तविक Loader अभी कनेक्ट नहीं है।\n' +
-                    'पहले अपने अधिकृत Loader का implementation जोड़ना होगा।'
-                );
-            }
-
-            if (text === '🛑 Stop Loader') {
-                loaderRunning = false;
-
-                return telegramBot.sendMessage(
-                    chatId,
-                    '🛑 Stop request received.'
-                );
-            }
+        if (text === '🆔 Submit UID') {
+            user.step = 'uid';
+            return send(chatId, 'अपनी UID भेजो:');
         }
 
-        const user = users.get(userId);
-        if (!user) return;
+        if (text === '📱 Submit WhatsApp Number') {
+            user.step = 'phone';
+            return send(
+                chatId,
+                'अपने WhatsApp अकाउंट का नंबर country code सहित भेजो।\nउदाहरण: +91XXXXXXXXXX'
+            );
+        }
 
+        if (text === '🏷️ Loader Name') {
+            user.step = 'loaderName';
+            return send(chatId, 'अपना Loader Name भेजो:');
+        }
+
+        if (text === '🔐 Generate Pairing Code') {
+            if (!user.phone) {
+                return send(
+                    chatId,
+                    'पहले WhatsApp नंबर दर्ज करो।'
+                );
+            }
+
+            return connectWhatsApp(user.phone, chatId);
+        }
+
+        if (text === '📊 Loader Status') {
+            return send(
+                chatId,
+                `WhatsApp: ${waStatus}\nLoader: ${loaderRunning ? 'RUNNING' : 'STOPPED'}`,
+                menu()
+            );
+        }
+
+        if (text === '▶️ Start Loader') {
+            if (waStatus !== 'CONNECTED') {
+                return send(
+                    chatId,
+                    'पहले WhatsApp pair करो। /pair चलाओ।',
+                    menu()
+                );
+            }
+
+            loaderRunning = true;
+
+            return send(
+                chatId,
+                '✅ Loader state RUNNING है।',
+                menu()
+            );
+        }
+
+        if (text === '🛑 Stop Loader') {
+            loaderRunning = false;
+
+            return send(
+                chatId,
+                '🛑 Loader stopped.',
+                menu()
+            );
+        }
+
+        // UID step.
         if (user.step === 'uid') {
             if (text.length < 3 || text.length > 100) {
-                return telegramBot.sendMessage(
+                return send(
                     chatId,
-                    'UID सही से भेजें।'
+                    '❌ UID 3 से 100 characters की होनी चाहिए।'
                 );
             }
 
             user.uid = text;
             user.step = 'phone';
 
-            return telegramBot.sendMessage(
+            return send(
                 chatId,
-                '✅ UID प्राप्त हुई।\nअब अपना WhatsApp नंबर country code सहित भेजें:'
+                '✅ UID saved.\nअब WhatsApp नंबर country code सहित भेजो।'
             );
         }
 
+        // Phone step.
         if (user.step === 'phone') {
             const phone = text.replace(/[\s()-]/g, '');
 
             if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
-                return telegramBot.sendMessage(
+                return send(
                     chatId,
-                    '❌ नंबर सही नहीं है। उदाहरण: +91XXXXXXXXXX'
+                    '❌ Number format सही नहीं है। उदाहरण: +91XXXXXXXXXX'
                 );
             }
 
             user.phone = phone;
+            user.step = 'loaderName';
+
+            await send(
+                chatId,
+                '✅ Number saved.\nअब Loader Name भेजो।'
+            );
+
+            return;
+        }
+
+        // Loader name step.
+        if (user.step === 'loaderName') {
+            if (text.length < 2 || text.length > 50) {
+                return send(
+                    chatId,
+                    '❌ Loader Name 2 से 50 characters का होना चाहिए।'
+                );
+            }
+
+            user.loaderName = text;
             user.step = 'ready';
 
-            return telegramBot.sendMessage(
+            return send(
                 chatId,
-                '✅ UID और नंबर प्राप्त हो गए।\n\n' +
-                '⚠️ Pairing Code बनाने के लिए वास्तविक WhatsApp ' +
-                'Loader कोड अभी जोड़ना बाकी है।\n\n' +
-                'अपना OTP या WhatsApp verification code किसी को न दें।',
-                mainMenu()
+                `✅ Setup complete!\nLoader Name: ${user.loaderName}\n\n` +
+                'WhatsApp pairing के लिए /pair चलाओ।',
+                menu()
             );
         }
 
         if (user.step === 'ready') {
-            return telegramBot.sendMessage(
-                chatId,
-                'Menu से विकल्प चुनें या /status भेजें।',
-                mainMenu()
-            );
-        }
-    });
-
-    telegramBot.on('polling_error', (err) => {
-        console.error('Telegram polling error:', err.message);
-    });
-
-    console.log('Telegram bot initialized.');
-} else {
-    console.log(
-        'Set TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID in Render Environment.'
-    );
-}
-
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
-});
+            return send
