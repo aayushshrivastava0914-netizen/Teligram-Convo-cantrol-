@@ -8,227 +8,272 @@ const PORT = process.env.PORT || 5000;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Dashboard files: public/index.html
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Track active sessions in memory
-const activeSessions = new Map();
-
-// Telegram configuration
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_OWNER_ID = process.env.TELEGRAM_OWNER_ID;
 
+const users = new Map();
 let telegramBot = null;
+let loaderRunning = false;
 
-// -------------------- WEB DASHBOARD --------------------
-
-// Main dashboard
 app.get('/', (req, res) => {
-    const indexPath = path.join(__dirname, 'public', 'index.html');
+    const file = path.join(__dirname, 'public', 'index.html');
 
-    if (fs.existsSync(indexPath)) {
-        return res.sendFile(indexPath);
+    if (fs.existsSync(file)) {
+        return res.sendFile(file);
     }
 
-    res.status(404).send('Dashboard file public/index.html not found.');
+    res.status(404).send('Dashboard file not found.');
 });
 
-// Health check
 app.get('/health', (req, res) => {
     res.json({
         status: 'online',
-        uptime: Math.floor(process.uptime()),
-        timestamp: new Date().toISOString()
+        uptime: Math.floor(process.uptime())
     });
 });
 
-// Server statistics
 app.get('/stats', (req, res) => {
     res.json({
         status: 'online',
-        uptime: Math.floor(process.uptime()),
-        activeSessions: activeSessions.size,
-        telegramEnabled: Boolean(telegramBot)
+        loaderRunning,
+        registeredUsers: users.size,
+        uptime: Math.floor(process.uptime())
     });
 });
 
-// Keep the route available for the existing dashboard.
-// Bulk messaging is intentionally not implemented here.
-app.post('/send', (req, res) => {
-    res.status(403).json({
-        success: false,
-        message:
-            'Bulk messaging is disabled. Use only consent-based messaging.'
-    });
-});
-
-// Stop tracked in-memory sessions
 app.post('/stop', (req, res) => {
-    let stopped = 0;
-
-    for (const [sessionId, session] of activeSessions.entries()) {
-        if (session && typeof session === 'object') {
-            if ('running' in session) {
-                session.running = false;
-            }
-
-            if ('stopRequested' in session) {
-                session.stopRequested = true;
-            }
-
-            stopped++;
-        }
-
-        activeSessions.delete(sessionId);
-    }
+    loaderRunning = false;
 
     res.json({
         success: true,
-        stoppedSessions: stopped,
-        message: 'Stop request processed.'
+        message: 'Stop request received.'
     });
 });
-
-// -------------------- TELEGRAM BOT --------------------
 
 if (TELEGRAM_BOT_TOKEN && TELEGRAM_OWNER_ID) {
     telegramBot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
         polling: true
     });
 
-    // Only allow your Telegram account to control the bot
     function isOwner(msg) {
-        return (
-            msg.from &&
-            String(msg.from.id) === String(TELEGRAM_OWNER_ID)
-        );
+        return msg.from &&
+            String(msg.from.id) === String(TELEGRAM_OWNER_ID);
     }
 
-    function denyAccess(msg) {
-        return telegramBot.sendMessage(
-            msg.chat.id,
-            '⛔ Access denied. You are not authorized.'
-        );
+    function mainMenu() {
+        return {
+            reply_markup: {
+                keyboard: [
+                    ['🆔 Submit UID'],
+                    ['📱 Submit WhatsApp Number'],
+                    ['📊 Loader Status'],
+                    ['▶️ Start Loader', '🛑 Stop Loader']
+                ],
+                resize_keyboard: true
+            }
+        };
     }
 
-    // /start
-    telegramBot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
+    telegramBot.onText(/^\/start$/, async (msg) => {
         if (!isOwner(msg)) {
-            return denyAccess(msg);
+            return telegramBot.sendMessage(
+                msg.chat.id,
+                '⛔ Access denied.'
+            );
+        }
+
+        users.set(msg.from.id, {
+            step: 'uid',
+            uid: null,
+            phone: null
+        });
+
+        await telegramBot.sendMessage(
+            msg.chat.id,
+            '🤖 Welcome to your Loader Bot!\n\n' +
+            'सबसे पहले अपनी UID भेजें।\n' +
+            'अपनी निजी जानकारी किसी अनजान व्यक्ति को न भेजें।'
+        );
+    });
+
+    telegramBot.onText(/^\/status$/, async (msg) => {
+        if (!isOwner(msg)) {
+            return telegramBot.sendMessage(
+                msg.chat.id,
+                '⛔ Access denied.'
+            );
         }
 
         await telegramBot.sendMessage(
             msg.chat.id,
-            'नमस्ते भाई! ❤️ Telegram bot चालू है।\n\n' +
-            'Available commands:\n' +
-            '/status - Server status\n' +
-            '/stop - Stop tracked sessions\n' +
-            '/help - Show commands'
+            '📊 Server: ONLINE\n' +
+            '⏱ Uptime: ' +
+            Math.floor(process.uptime()) + ' seconds\n' +
+            '▶️ Loader: ' +
+            (loaderRunning ? 'RUNNING' : 'STOPPED')
         );
     });
 
-    // /help
-    telegramBot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
+    telegramBot.onText(/^\/stop$/, async (msg) => {
         if (!isOwner(msg)) {
-            return denyAccess(msg);
+            return telegramBot.sendMessage(
+                msg.chat.id,
+                '⛔ Access denied.'
+            );
+        }
+
+        loaderRunning = false;
+
+        await telegramBot.sendMessage(
+            msg.chat.id,
+            '🛑 Stop request received.\n' +
+            'यह कमांड Render सर्वर को बंद नहीं करती।'
+        );
+    });
+
+    telegramBot.onText(/^\/help$/, async (msg) => {
+        if (!isOwner(msg)) {
+            return telegramBot.sendMessage(
+                msg.chat.id,
+                '⛔ Access denied.'
+            );
         }
 
         await telegramBot.sendMessage(
             msg.chat.id,
-            '🤖 Bot Commands\n\n' +
-            '/start - Start menu\n' +
-            '/status - Check server status\n' +
-            '/stop - Stop tracked sessions\n' +
-            '/help - Show this help'
+            '/start - Start bot\n' +
+            '/status - Check status\n' +
+            '/stop - Stop request\n' +
+            '/help - Help menu',
+            mainMenu()
         );
     });
 
-    // /status
-    telegramBot.onText(/^\/status(?:@\w+)?$/, async (msg) => {
-        if (!isOwner(msg)) {
-            return denyAccess(msg);
-        }
+    telegramBot.on('message', async (msg) => {
+        if (!msg.text || !isOwner(msg)) return;
+        if (msg.text.startsWith('/')) return;
 
-        const uptimeSeconds = Math.floor(process.uptime());
-        const hours = Math.floor(uptimeSeconds / 3600);
-        const minutes = Math.floor((uptimeSeconds % 3600) / 60);
-        const seconds = uptimeSeconds % 60;
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        const text = msg.text.trim();
 
-        await telegramBot.sendMessage(
-            msg.chat.id,
-            '✅ Server Status: ONLINE\n' +
-            '⏱️ Uptime: ' +
-            `${hours}h ${minutes}m ${seconds}s\n` +
-            '📊 Active Sessions: ' +
-            activeSessions.size +
-            '\n🤖 Telegram: Connected'
-        );
-    });
+        if (
+            ['🆔 Submit UID', '📱 Submit WhatsApp Number',
+             '📊 Loader Status', '▶️ Start Loader',
+             '🛑 Stop Loader'].includes(text)
+        ) {
+            if (text === '🆔 Submit UID') {
+                users.set(userId, { step: 'uid' });
 
-    // /stop
-    telegramBot.onText(/^\/stop(?:@\w+)?$/, async (msg) => {
-        if (!isOwner(msg)) {
-            return denyAccess(msg);
-        }
-
-        let stopped = 0;
-
-        for (const [sessionId, session] of activeSessions.entries()) {
-            if (session && typeof session === 'object') {
-                if ('running' in session) {
-                    session.running = false;
-                }
-
-                if ('stopRequested' in session) {
-                    session.stopRequested = true;
-                }
-
-                stopped++;
+                return telegramBot.sendMessage(
+                    chatId,
+                    'अपनी UID भेजें:'
+                );
             }
 
-            activeSessions.delete(sessionId);
+            if (text === '📱 Submit WhatsApp Number') {
+                users.set(userId, {
+                    ...(users.get(userId) || {}),
+                    step: 'phone'
+                });
+
+                return telegramBot.sendMessage(
+                    chatId,
+                    'Country code सहित नंबर भेजें। उदाहरण: +91XXXXXXXXXX'
+                );
+            }
+
+            if (text === '📊 Loader Status') {
+                return telegramBot.sendMessage(
+                    chatId,
+                    'Loader: ' +
+                    (loaderRunning ? 'RUNNING' : 'STOPPED')
+                );
+            }
+
+            if (text === '▶️ Start Loader') {
+                return telegramBot.sendMessage(
+                    chatId,
+                    '⚠️ वास्तविक Loader अभी कनेक्ट नहीं है।\n' +
+                    'पहले अपने अधिकृत Loader का implementation जोड़ना होगा।'
+                );
+            }
+
+            if (text === '🛑 Stop Loader') {
+                loaderRunning = false;
+
+                return telegramBot.sendMessage(
+                    chatId,
+                    '🛑 Stop request received.'
+                );
+            }
         }
 
-        await telegramBot.sendMessage(
-            msg.chat.id,
-            '🛑 Stop request processed.\n' +
-            'Sessions processed: ' + stopped + '\n\n' +
-            'Note: This does not shut down the Render server.'
-        );
+        const user = users.get(userId);
+        if (!user) return;
+
+        if (user.step === 'uid') {
+            if (text.length < 3 || text.length > 100) {
+                return telegramBot.sendMessage(
+                    chatId,
+                    'UID सही से भेजें।'
+                );
+            }
+
+            user.uid = text;
+            user.step = 'phone';
+
+            return telegramBot.sendMessage(
+                chatId,
+                '✅ UID प्राप्त हुई।\nअब अपना WhatsApp नंबर country code सहित भेजें:'
+            );
+        }
+
+        if (user.step === 'phone') {
+            const phone = text.replace(/[\s()-]/g, '');
+
+            if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+                return telegramBot.sendMessage(
+                    chatId,
+                    '❌ नंबर सही नहीं है। उदाहरण: +91XXXXXXXXXX'
+                );
+            }
+
+            user.phone = phone;
+            user.step = 'ready';
+
+            return telegramBot.sendMessage(
+                chatId,
+                '✅ UID और नंबर प्राप्त हो गए।\n\n' +
+                '⚠️ Pairing Code बनाने के लिए वास्तविक WhatsApp ' +
+                'Loader कोड अभी जोड़ना बाकी है।\n\n' +
+                'अपना OTP या WhatsApp verification code किसी को न दें।',
+                mainMenu()
+            );
+        }
+
+        if (user.step === 'ready') {
+            return telegramBot.sendMessage(
+                chatId,
+                'Menu से विकल्प चुनें या /status भेजें।',
+                mainMenu()
+            );
+        }
     });
 
-    telegramBot.on('polling_error', (error) => {
-        console.error('Telegram polling error:', error.message);
+    telegramBot.on('polling_error', (err) => {
+        console.error('Telegram polling error:', err.message);
     });
 
-    console.log('✅ Telegram bot initialized');
+    console.log('Telegram bot initialized.');
 } else {
     console.log(
-        '⚠️ Telegram bot disabled. Set TELEGRAM_BOT_TOKEN ' +
-        'and TELEGRAM_OWNER_ID in Render Environment.'
+        'Set TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID in Render Environment.'
     );
 }
 
-// -------------------- START SERVER --------------------
-
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
-
-// -------------------- GRACEFUL SHUTDOWN --------------------
-
-function shutdown() {
-    console.log('Server shutting down...');
-
-    if (telegramBot) {
-        telegramBot.stopPolling().catch((error) => {
-            console.error('Telegram shutdown error:', error.message);
-        });
-    }
-
-    process.exit(0);
-}
-
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
